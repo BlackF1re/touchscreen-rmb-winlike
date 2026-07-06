@@ -48,6 +48,8 @@ while :; do
     pid="$(find_lxqt_session_pid)"
     if [ -n "$pid" ] && [ -r "/proc/$pid/environ" ]; then
         eval "$(load_session_env "$pid")"
+        systemctl --user stop touchscreen-rmb-winlike-c.service >/dev/null 2>&1 || true
+        pkill -x touchscreen-rmb-winlike-c >/dev/null 2>&1 || true
         exec "$@"
     fi
     sleep 2

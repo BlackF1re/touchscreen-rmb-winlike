@@ -1,5 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "config.h"
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -8,7 +10,6 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,15 +23,9 @@
 #include <X11/extensions/shape.h>
 
 #define DEVICE_NAME "CHPN0001:00"
-#define PRE_ARM_SECONDS 0.30
-#define ANIMATION_SECONDS 0.30
-#define PRE_ARM_THRESHOLD 18.0
 #define ANIMATION_FRAME_MS 16
-#define MIN_SQUARE_SIZE 10
-#define MAX_SQUARE_SIZE 60
-#define OVERLAY_LINE_WIDTH 1
 
-struct daemon_state {
+typedef struct {
     Display *display;
     int screen;
     Window root;
@@ -49,14 +44,17 @@ struct daemon_state {
     double down_since;
     double arm_deadline;
     double animation_started_at;
-    bool have_current;
+    bool have_x;
+    bool have_y;
     bool finger_down;
     bool armed;
+    bool cancelled;
     bool completed;
     bool triggered;
     bool input_frozen;
     bool overlay_visible;
-};
+    TouchRMBConfig config;
+} DaemonState;
 
 static volatile sig_atomic_t g_running = 1;
 static const char *g_home = NULL;
@@ -68,6 +66,7 @@ static void handle_signal(int signo) {
 
 static double monotonic_seconds(void) {
     struct timespec ts;
+
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
@@ -83,17 +82,17 @@ static const char *cache_dir(void) {
     return path;
 }
 
+static bool build_cache_path(char *buffer, size_t size, const char *suffix) {
+    int written = snprintf(buffer, size, "%s/%s", cache_dir(), suffix);
+    return written >= 0 && (size_t)written < size;
+}
+
 static void sleep_milliseconds(long ms) {
     struct timespec ts;
 
     ts.tv_sec = ms / 1000;
     ts.tv_nsec = (ms % 1000) * 1000000L;
     nanosleep(&ts, NULL);
-}
-
-static bool build_home_path(char *buffer, size_t size, const char *suffix) {
-    int written = snprintf(buffer, size, "%s/%s", cache_dir(), suffix);
-    return written >= 0 && (size_t)written < size;
 }
 
 static void log_message(const char *fmt, ...) {
@@ -104,7 +103,7 @@ static void log_message(const char *fmt, ...) {
     char stamp[32];
     va_list args;
 
-    if (!build_home_path(path, sizeof(path), "touchscreen-rmb-winlike-c.log")) {
+    if (!build_cache_path(path, sizeof(path), "touchrmb.log")) {
         return;
     }
     handle = fopen(path, "a");
@@ -126,6 +125,7 @@ static void log_message(const char *fmt, ...) {
 static bool distance_exceeded(double ax, double ay, double bx, double by, double threshold) {
     double dx = ax - bx;
     double dy = ay - by;
+
     return dx * dx + dy * dy > threshold * threshold;
 }
 
@@ -150,6 +150,7 @@ static int run_command_capture(const char *command, char *buffer, size_t size) {
 
 static void run_command_quiet(const char *command) {
     FILE *pipe = popen(command, "r");
+
     if (!pipe) {
         return;
     }
@@ -158,7 +159,7 @@ static void run_command_quiet(const char *command) {
     pclose(pipe);
 }
 
-static void refresh_xinput_id(struct daemon_state *state) {
+static void refresh_xinput_id(DaemonState *state) {
     char output[4096];
     char *line;
     char *saveptr = NULL;
@@ -205,7 +206,7 @@ static bool get_pointer_location(int *x, int *y) {
     return have_x && have_y;
 }
 
-static void freeze_pointer(struct daemon_state *state) {
+static void freeze_pointer(DaemonState *state) {
     char command[128];
 
     if (state->input_frozen) {
@@ -226,7 +227,7 @@ static void freeze_pointer(struct daemon_state *state) {
     log_message("freeze pointer=(%d,%d)", state->pointer_x, state->pointer_y);
 }
 
-static void unfreeze_pointer(struct daemon_state *state) {
+static void unfreeze_pointer(DaemonState *state) {
     char command[128];
 
     if (!state->input_frozen) {
@@ -281,10 +282,11 @@ static int open_touch_device(char *path, size_t path_size) {
     return -1;
 }
 
-static bool init_overlay(struct daemon_state *state) {
+static bool init_overlay(DaemonState *state) {
     XColor color;
     Colormap colormap;
     XSetWindowAttributes attrs;
+    char hex_color[16];
 
     state->display = XOpenDisplay(NULL);
     if (!state->display) {
@@ -295,7 +297,8 @@ static bool init_overlay(struct daemon_state *state) {
     state->root = RootWindow(state->display, state->screen);
     colormap = DefaultColormap(state->display, state->screen);
 
-    if (!XParseColor(state->display, colormap, "#3899fa", &color) ||
+    touchrmb_config_format_color(&state->config, hex_color, sizeof(hex_color));
+    if (!XParseColor(state->display, colormap, hex_color, &color) ||
         !XAllocColor(state->display, colormap, &color)) {
         state->overlay_pixel = WhitePixel(state->display, state->screen);
     } else {
@@ -319,12 +322,11 @@ static bool init_overlay(struct daemon_state *state) {
         CWOverrideRedirect | CWBackPixel | CWBorderPixel,
         &attrs
     );
-
     XFlush(state->display);
     return true;
 }
 
-static void hide_overlay(struct daemon_state *state) {
+static void hide_overlay(DaemonState *state) {
     if (!state->overlay_visible) {
         return;
     }
@@ -333,8 +335,9 @@ static void hide_overlay(struct daemon_state *state) {
     state->overlay_visible = false;
 }
 
-static void show_overlay_progress(struct daemon_state *state, double progress) {
+static void show_overlay_progress(DaemonState *state, double progress) {
     int size;
+    int line_width;
     int left;
     int top;
     XRectangle rects[4];
@@ -342,7 +345,6 @@ static void show_overlay_progress(struct daemon_state *state, double progress) {
     if (!state->display) {
         return;
     }
-
     if (progress < 0.0) {
         progress = 0.0;
     }
@@ -350,18 +352,19 @@ static void show_overlay_progress(struct daemon_state *state, double progress) {
         progress = 1.0;
     }
 
-    size = (int)(MIN_SQUARE_SIZE + progress * (MAX_SQUARE_SIZE - MIN_SQUARE_SIZE) + 0.5);
-    if (size < OVERLAY_LINE_WIDTH * 2) {
-        size = OVERLAY_LINE_WIDTH * 2;
+    line_width = state->config.line_width;
+    size = (int)(10.0 + progress * (double)(state->config.square_size - 10) + 0.5);
+    if (size < line_width * 2) {
+        size = line_width * 2;
     }
 
     left = state->pointer_x - size / 2;
     top = state->pointer_y - size / 2;
 
-    rects[0] = (XRectangle){0, 0, (unsigned short)size, OVERLAY_LINE_WIDTH};
-    rects[1] = (XRectangle){0, (short)(size - OVERLAY_LINE_WIDTH), (unsigned short)size, OVERLAY_LINE_WIDTH};
-    rects[2] = (XRectangle){0, 0, OVERLAY_LINE_WIDTH, (unsigned short)size};
-    rects[3] = (XRectangle){(short)(size - OVERLAY_LINE_WIDTH), 0, OVERLAY_LINE_WIDTH, (unsigned short)size};
+    rects[0] = (XRectangle){0, 0, (unsigned short)size, (unsigned short)line_width};
+    rects[1] = (XRectangle){0, (short)(size - line_width), (unsigned short)size, (unsigned short)line_width};
+    rects[2] = (XRectangle){0, 0, (unsigned short)line_width, (unsigned short)size};
+    rects[3] = (XRectangle){(short)(size - line_width), 0, (unsigned short)line_width, (unsigned short)size};
 
     XMoveResizeWindow(state->display, state->overlay, left, top, (unsigned int)size, (unsigned int)size);
     XShapeCombineRectangles(state->display, state->overlay, ShapeBounding, 0, 0, rects, 4, ShapeSet, 0);
@@ -378,28 +381,31 @@ static void show_overlay_progress(struct daemon_state *state, double progress) {
     XFlush(state->display);
 }
 
-static void reset_press(struct daemon_state *state) {
+static void reset_press(DaemonState *state) {
     state->finger_down = false;
     state->armed = false;
+    state->cancelled = false;
     state->completed = false;
     state->triggered = false;
     state->down_since = 0.0;
     state->arm_deadline = 0.0;
     state->animation_started_at = 0.0;
-    state->have_current = false;
+    state->have_x = false;
+    state->have_y = false;
     hide_overlay(state);
     unfreeze_pointer(state);
 }
 
-static void on_press(struct daemon_state *state) {
+static void on_press(DaemonState *state) {
     double now = monotonic_seconds();
 
     state->finger_down = true;
     state->armed = false;
+    state->cancelled = false;
     state->completed = false;
     state->triggered = false;
     state->down_since = now;
-    state->arm_deadline = now + PRE_ARM_SECONDS;
+    state->arm_deadline = now + (double)state->config.pre_arm_ms / 1000.0;
     state->animation_started_at = 0.0;
     state->anchor_x = state->current_x;
     state->anchor_y = state->current_y;
@@ -407,7 +413,7 @@ static void on_press(struct daemon_state *state) {
     log_message("press anchor=(%.1f,%.1f)", state->anchor_x, state->anchor_y);
 }
 
-static void on_release(struct daemon_state *state) {
+static void on_release(DaemonState *state) {
     double held_for = state->down_since > 0.0 ? monotonic_seconds() - state->down_since : 0.0;
 
     if (state->completed && !state->triggered) {
@@ -428,10 +434,8 @@ static void on_release(struct daemon_state *state) {
     reset_press(state);
 }
 
-static void handle_motion(struct daemon_state *state) {
-    double now;
-
-    if (!state->finger_down || state->armed || state->triggered || !state->have_current) {
+static void handle_motion(DaemonState *state) {
+    if (!state->finger_down || state->armed || state->triggered || state->cancelled || !state->have_x || !state->have_y) {
         return;
     }
     if (!distance_exceeded(
@@ -439,28 +443,30 @@ static void handle_motion(struct daemon_state *state) {
             state->anchor_y,
             state->current_x,
             state->current_y,
-            PRE_ARM_THRESHOLD)) {
+            18.0)) {
         return;
     }
 
-    now = monotonic_seconds();
-    state->anchor_x = state->current_x;
-    state->anchor_y = state->current_y;
-    state->down_since = now;
-    state->arm_deadline = now + PRE_ARM_SECONDS;
+    state->cancelled = true;
     hide_overlay(state);
-    log_message("anchor reset=(%.1f,%.1f)", state->anchor_x, state->anchor_y);
+    log_message(
+        "long press cancelled by motion start=(%.1f,%.1f) current=(%.1f,%.1f)",
+        state->anchor_x,
+        state->anchor_y,
+        state->current_x,
+        state->current_y
+    );
 }
 
-static void process_event(struct daemon_state *state, const struct input_event *event) {
+static void process_event(DaemonState *state, const struct input_event *event) {
     if (event->type == EV_ABS) {
         if (event->code == ABS_X || event->code == ABS_MT_POSITION_X) {
             state->current_x = (double)event->value;
-            state->have_current = true;
+            state->have_x = true;
             handle_motion(state);
         } else if (event->code == ABS_Y || event->code == ABS_MT_POSITION_Y) {
             state->current_y = (double)event->value;
-            state->have_current = true;
+            state->have_y = true;
             handle_motion(state);
         }
     } else if (event->type == EV_KEY && event->code == BTN_TOUCH) {
@@ -472,7 +478,7 @@ static void process_event(struct daemon_state *state, const struct input_event *
     }
 }
 
-static void attach_touch_device(struct daemon_state *state) {
+static void attach_touch_device(DaemonState *state) {
     if (state->touch_fd >= 0) {
         return;
     }
@@ -483,7 +489,7 @@ static void attach_touch_device(struct daemon_state *state) {
     }
 }
 
-static void detach_touch_device(struct daemon_state *state, const char *reason) {
+static void detach_touch_device(DaemonState *state, const char *reason) {
     if (reason) {
         log_message("%s", reason);
     }
@@ -494,10 +500,10 @@ static void detach_touch_device(struct daemon_state *state, const char *reason) 
     reset_press(state);
 }
 
-static void update_timers(struct daemon_state *state, double now) {
+static void update_timers(DaemonState *state, double now) {
     double progress;
 
-    if (state->finger_down && !state->armed && !state->triggered && state->arm_deadline > 0.0 && now >= state->arm_deadline) {
+    if (state->finger_down && !state->armed && !state->cancelled && !state->triggered && state->arm_deadline > 0.0 && now >= state->arm_deadline) {
         state->armed = true;
         state->animation_started_at = now;
         freeze_pointer(state);
@@ -509,7 +515,7 @@ static void update_timers(struct daemon_state *state, double now) {
         return;
     }
 
-    progress = (now - state->animation_started_at) / ANIMATION_SECONDS;
+    progress = (now - state->animation_started_at) / ((double)state->config.animation_ms / 1000.0);
     if (progress > 1.0) {
         progress = 1.0;
     }
@@ -520,11 +526,11 @@ static void update_timers(struct daemon_state *state, double now) {
     }
 }
 
-static int compute_poll_timeout_ms(const struct daemon_state *state, double now) {
+static int compute_poll_timeout_ms(const DaemonState *state, double now) {
     if (state->touch_fd < 0) {
         return 1000;
     }
-    if (state->finger_down && !state->armed && !state->triggered) {
+    if (state->finger_down && !state->armed && !state->cancelled && !state->triggered) {
         double remaining = state->arm_deadline - now;
         if (remaining <= 0.0) {
             return 0;
@@ -537,12 +543,12 @@ static int compute_poll_timeout_ms(const struct daemon_state *state, double now)
     return -1;
 }
 
-static bool acquire_lock(struct daemon_state *state) {
+static bool acquire_lock(DaemonState *state) {
     char path[PATH_MAX];
     char buffer[32];
     ssize_t ignored;
 
-    if (!build_home_path(path, sizeof(path), "touchscreen-rmb-winlike-c.lock")) {
+    if (!build_cache_path(path, sizeof(path), "touchrmb.lock")) {
         return false;
     }
     state->lock_fd = open(path, O_CREAT | O_RDWR, 0600);
@@ -563,7 +569,7 @@ static bool acquire_lock(struct daemon_state *state) {
     return true;
 }
 
-static void cleanup(struct daemon_state *state) {
+static void cleanup(DaemonState *state) {
     hide_overlay(state);
     unfreeze_pointer(state);
     if (state->touch_fd >= 0) {
@@ -582,7 +588,7 @@ static void cleanup(struct daemon_state *state) {
 }
 
 int main(void) {
-    struct daemon_state state;
+    DaemonState state;
 
     memset(&state, 0, sizeof(state));
     state.touch_fd = -1;
@@ -592,6 +598,9 @@ int main(void) {
         fprintf(stderr, "HOME is not set\n");
         return 1;
     }
+
+    touchrmb_config_defaults(&state.config);
+    touchrmb_config_load(&state.config);
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
@@ -643,6 +652,7 @@ int main(void) {
             while ((bytes = read(state.touch_fd, events, sizeof(events))) > 0) {
                 size_t count = (size_t)bytes / sizeof(events[0]);
                 size_t index;
+
                 for (index = 0; index < count; ++index) {
                     process_event(&state, &events[index]);
                 }

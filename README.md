@@ -1,14 +1,19 @@
-# Touchscreen RMB Winlike C
+# TouchRMB
 
-Lightweight touchscreen long-press to right-click daemon for the Chuwi Vi10 LXQt session.
+TouchRMB is a lightweight touchscreen long-press to right-click implementation for the Chuwi Vi10 LXQt session.
 
-This version is designed to replace the Python/GTK prototype with a smaller runtime footprint:
+The project contains two binaries:
 
-- `C` instead of Python
+- `touchrmb`: low-overhead daemon in plain C
+- `touchrmb-settings`: settings UI in C/GTK
+
+Design goals:
+
+- no Python runtime for the resident daemon
 - direct `/dev/input/event*` reading via `linux/input.h`
-- `poll()` event loop with no background busy wakeups in idle
-- `X11 + XShape` border-only overlay
-- existing `xinput` and `xdotool` tools are reused for pointer freeze and RMB emission
+- `poll()` event loop with idle CPU near zero
+- `X11 + XShape` overlay for the expanding square
+- user-configurable hold delay, animation duration, square size, border width, and color
 
 ## Build
 
@@ -16,26 +21,38 @@ This version is designed to replace the Python/GTK prototype with a smaller runt
 make
 ```
 
-The resulting binary is:
+Artifacts:
 
 ```sh
-build/touchscreen-rmb-winlike-c
+build/touchrmb
+build/touchrmb-settings
 ```
 
 ## Install
 
 ```sh
-install -Dm755 build/touchscreen-rmb-winlike-c ~/.local/bin/touchscreen-rmb-winlike-c
-install -Dm755 packaging/bin/run-rmb-in-lxqt-session.sh ~/.local/bin/run-rmb-in-lxqt-session.sh
-install -Dm644 packaging/systemd-user/touchscreen-rmb-winlike-c.service ~/.config/systemd/user/touchscreen-rmb-winlike-c.service
+install -Dm755 build/touchrmb ~/.local/bin/touchrmb
+install -Dm755 build/touchrmb-settings ~/.local/bin/touchrmb-settings
+install -Dm755 packaging/bin/run-touchrmb-in-lxqt-session.sh ~/.local/bin/run-touchrmb-in-lxqt-session.sh
+install -Dm644 packaging/systemd-user/touchrmb.service ~/.config/systemd/user/touchrmb.service
+install -Dm644 packaging/applications/touchrmb.desktop ~/.local/share/applications/touchrmb.desktop
 systemctl --user daemon-reload
-systemctl --user disable --now touchscreen-rmb-winlike.service
-systemctl --user enable --now touchscreen-rmb-winlike-c.service
+systemctl --user enable --now touchrmb.service
 ```
+
+## Configuration
+
+User configuration is stored at:
+
+```sh
+~/.config/touchrmb/config.ini
+```
+
+The settings application writes the config and restarts the user service.
 
 ## Runtime notes
 
-- Touch device name is hardcoded as `CHPN0001:00`.
-- Overlay is intentionally border-only to avoid heavier graphics dependencies.
-- Log file: `~/.cache/touchscreen-rmb-winlike-c.log`
-- Lock file: `~/.cache/touchscreen-rmb-winlike-c.lock`
+- Touch device name is hardcoded as `CHPN0001:00`
+- Border-only overlay keeps the daemon light
+- Daemon log: `~/.cache/touchrmb.log`
+- Daemon lock: `~/.cache/touchrmb.lock`

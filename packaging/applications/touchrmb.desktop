@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=TouchRMB
+Comment=Configure touchscreen hold-to-right-click behavior
+Exec=/home/paul/.local/bin/touchrmb-settings
+Icon=input-touchpad
+Categories=Settings;DesktopSettings;GTK;
+Terminal=false
+StartupNotify=true
