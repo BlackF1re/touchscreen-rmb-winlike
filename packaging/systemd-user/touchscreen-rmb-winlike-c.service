@@ -1,0 +1,13 @@
+[Unit]
+Description=Touchscreen RMB Winlike C
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/run-rmb-in-lxqt-session.sh %h/.local/bin/touchscreen-rmb-winlike-c
+Restart=always
+RestartSec=0.2
+
+[Install]
+WantedBy=default.target
