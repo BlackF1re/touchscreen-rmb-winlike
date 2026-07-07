@@ -5,7 +5,7 @@ Wants=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/run-touchrmb-in-lxqt-session.sh %h/.local/bin/touchrmb
+ExecStart=/usr/local/bin/run-touchrmb-in-lxqt-session.sh /usr/local/bin/touchrmb
 Restart=always
 RestartSec=0.2
 

@@ -8,7 +8,6 @@
 #include <limits.h>
 #include <poll.h>
 #include <signal.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,10 +19,23 @@
 
 #include <linux/input.h>
 #include <X11/Xlib.h>
+#include <X11/extensions/XInput2.h>
+#include <X11/extensions/XTest.h>
+#include <X11/extensions/Xrandr.h>
 #include <X11/extensions/shape.h>
 
-#define DEVICE_NAME "CHPN0001:00"
 #define ANIMATION_FRAME_MS 16
+#define INITIAL_OVERLAY_SIZE 10
+#define MOTION_THRESHOLD 18
+#define MOTION_THRESHOLD_SQ (MOTION_THRESHOLD * MOTION_THRESHOLD)
+#define PREFERRED_TOUCH_NAME "CHPN0001:00"
+
+typedef enum {
+    ROTATION_NORMAL = 0,
+    ROTATION_LEFT,
+    ROTATION_RIGHT,
+    ROTATION_INVERTED,
+} DisplayRotation;
 
 typedef struct {
     Display *display;
@@ -33,26 +45,35 @@ typedef struct {
     unsigned long overlay_pixel;
     int touch_fd;
     int lock_fd;
-    char touch_path[PATH_MAX];
-    char xinput_id[32];
+    int touch_xi_id;
+    int screen_width;
+    int screen_height;
+    int abs_x_min;
+    int abs_x_max;
+    int abs_y_min;
+    int abs_y_max;
+    int current_x;
+    int current_y;
+    int anchor_x;
+    int anchor_y;
     int pointer_x;
     int pointer_y;
-    double current_x;
-    double current_y;
-    double anchor_x;
-    double anchor_y;
-    double down_since;
-    double arm_deadline;
-    double animation_started_at;
+    unsigned long long arm_deadline_ms;
+    unsigned long long animation_started_ms;
     bool have_x;
     bool have_y;
+    bool have_abs_x;
+    bool have_abs_y;
+    bool have_xi2;
     bool finger_down;
     bool armed;
     bool cancelled;
     bool completed;
     bool triggered;
-    bool input_frozen;
+    bool touch_grabbed;
     bool overlay_visible;
+    char touch_name[256];
+    DisplayRotation rotation;
     TouchRMBConfig config;
 } DaemonState;
 
@@ -64,11 +85,11 @@ static void handle_signal(int signo) {
     g_running = 0;
 }
 
-static double monotonic_seconds(void) {
+static unsigned long long monotonic_milliseconds(void) {
     struct timespec ts;
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+    return (unsigned long long)ts.tv_sec * 1000ULL + (unsigned long long)ts.tv_nsec / 1000000ULL;
 }
 
 static const char *cache_dir(void) {
@@ -87,170 +108,365 @@ static bool build_cache_path(char *buffer, size_t size, const char *suffix) {
     return written >= 0 && (size_t)written < size;
 }
 
-static void sleep_milliseconds(long ms) {
-    struct timespec ts;
+static bool test_bit(const unsigned long *bits, size_t bit) {
+    size_t index = bit / (sizeof(bits[0]) * 8U);
+    size_t offset = bit % (sizeof(bits[0]) * 8U);
 
-    ts.tv_sec = ms / 1000;
-    ts.tv_nsec = (ms % 1000) * 1000000L;
-    nanosleep(&ts, NULL);
+    return (bits[index] & (1UL << offset)) != 0;
 }
 
-static void log_message(const char *fmt, ...) {
-    char path[PATH_MAX];
-    FILE *handle;
-    time_t now;
-    struct tm tm_now;
-    char stamp[32];
-    va_list args;
+static bool is_touchscreen_device(int fd) {
+    unsigned long ev_bits[(EV_MAX + (sizeof(unsigned long) * 8U)) / (sizeof(unsigned long) * 8U)] = {0};
+    unsigned long key_bits[(KEY_MAX + (sizeof(unsigned long) * 8U)) / (sizeof(unsigned long) * 8U)] = {0};
+    unsigned long abs_bits[(ABS_MAX + (sizeof(unsigned long) * 8U)) / (sizeof(unsigned long) * 8U)] = {0};
+    unsigned long prop_bits[(INPUT_PROP_MAX + (sizeof(unsigned long) * 8U)) / (sizeof(unsigned long) * 8U)] = {0};
 
-    if (!build_cache_path(path, sizeof(path), "touchrmb.log")) {
-        return;
-    }
-    handle = fopen(path, "a");
-    if (!handle) {
-        return;
-    }
-
-    now = time(NULL);
-    localtime_r(&now, &tm_now);
-    strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm_now);
-    fprintf(handle, "%s ", stamp);
-    va_start(args, fmt);
-    vfprintf(handle, fmt, args);
-    va_end(args);
-    fputc('\n', handle);
-    fclose(handle);
-}
-
-static bool distance_exceeded(double ax, double ay, double bx, double by, double threshold) {
-    double dx = ax - bx;
-    double dy = ay - by;
-
-    return dx * dx + dy * dy > threshold * threshold;
-}
-
-static int run_command_capture(const char *command, char *buffer, size_t size) {
-    FILE *pipe;
-    size_t used = 0;
-
-    if (size == 0) {
-        return -1;
-    }
-    buffer[0] = '\0';
-    pipe = popen(command, "r");
-    if (!pipe) {
-        return -1;
-    }
-    while (used + 1 < size && fgets(buffer + used, (int)(size - used), pipe)) {
-        used = strlen(buffer);
-    }
-    pclose(pipe);
-    return 0;
-}
-
-static void run_command_quiet(const char *command) {
-    FILE *pipe = popen(command, "r");
-
-    if (!pipe) {
-        return;
-    }
-    while (fgetc(pipe) != EOF) {
-    }
-    pclose(pipe);
-}
-
-static void refresh_xinput_id(DaemonState *state) {
-    char output[4096];
-    char *line;
-    char *saveptr = NULL;
-
-    state->xinput_id[0] = '\0';
-    if (run_command_capture("xinput list --short 2>/dev/null", output, sizeof(output)) != 0) {
-        return;
-    }
-
-    line = strtok_r(output, "\n", &saveptr);
-    while (line) {
-        if (strstr(line, DEVICE_NAME) && strstr(line, "[slave  pointer")) {
-            char *id = strstr(line, "id=");
-            if (id) {
-                snprintf(state->xinput_id, sizeof(state->xinput_id), "%d", atoi(id + 3));
-                return;
-            }
-        }
-        line = strtok_r(NULL, "\n", &saveptr);
-    }
-}
-
-static bool get_pointer_location(int *x, int *y) {
-    char output[256];
-    char *line;
-    char *saveptr = NULL;
-    bool have_x = false;
-    bool have_y = false;
-
-    if (run_command_capture("xdotool getmouselocation --shell 2>/dev/null", output, sizeof(output)) != 0) {
+    if (ioctl(fd, EVIOCGBIT(0, sizeof(ev_bits)), ev_bits) < 0 || !test_bit(ev_bits, EV_ABS)) {
         return false;
     }
-    line = strtok_r(output, "\n", &saveptr);
-    while (line) {
-        if (strncmp(line, "X=", 2) == 0) {
-            *x = atoi(line + 2);
-            have_x = true;
-        } else if (strncmp(line, "Y=", 2) == 0) {
-            *y = atoi(line + 2);
-            have_y = true;
+    (void)ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits);
+    (void)ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(abs_bits)), abs_bits);
+    (void)ioctl(fd, EVIOCGPROP(sizeof(prop_bits)), prop_bits);
+
+    return test_bit(prop_bits, INPUT_PROP_DIRECT) &&
+        test_bit(key_bits, BTN_TOUCH) &&
+        ((test_bit(abs_bits, ABS_MT_POSITION_X) && test_bit(abs_bits, ABS_MT_POSITION_Y)) ||
+            (test_bit(abs_bits, ABS_X) && test_bit(abs_bits, ABS_Y)));
+}
+
+static void load_abs_axis(int fd, int mt_code, int fallback_code, int *minimum, int *maximum, bool *available) {
+    struct input_absinfo info;
+
+    *available = false;
+    if (ioctl(fd, EVIOCGABS(mt_code), &info) == 0 || ioctl(fd, EVIOCGABS(fallback_code), &info) == 0) {
+        *minimum = info.minimum;
+        *maximum = info.maximum;
+        *available = true;
+    }
+}
+
+static void load_abs_info(DaemonState *state) {
+    load_abs_axis(state->touch_fd, ABS_MT_POSITION_X, ABS_X, &state->abs_x_min, &state->abs_x_max, &state->have_abs_x);
+    load_abs_axis(state->touch_fd, ABS_MT_POSITION_Y, ABS_Y, &state->abs_y_min, &state->abs_y_max, &state->have_abs_y);
+}
+
+static int find_touch_xi_device(DaemonState *state) {
+    XIDeviceInfo *devices;
+    int count = 0;
+    int index;
+    int device_id = -1;
+
+    if (!state->have_xi2 || state->touch_name[0] == '\0') {
+        return -1;
+    }
+
+    devices = XIQueryDevice(state->display, XIAllDevices, &count);
+    if (!devices) {
+        return -1;
+    }
+
+    for (index = 0; index < count; ++index) {
+        if (devices[index].use == XISlavePointer &&
+            devices[index].name &&
+            strcmp(devices[index].name, state->touch_name) == 0) {
+            device_id = devices[index].deviceid;
+            break;
         }
-        line = strtok_r(NULL, "\n", &saveptr);
     }
-    return have_x && have_y;
+
+    XIFreeDeviceInfo(devices);
+    return device_id;
 }
 
-static void freeze_pointer(DaemonState *state) {
-    char command[128];
+static DisplayRotation detect_display_rotation(DaemonState *state) {
+    Rotation current = RR_Rotate_0;
 
-    if (state->input_frozen) {
+    (void)XRRRotations(state->display, state->screen, &current);
+    if (current & RR_Rotate_90) {
+        return ROTATION_RIGHT;
+    }
+    if (current & RR_Rotate_270) {
+        return ROTATION_LEFT;
+    }
+    if (current & RR_Rotate_180) {
+        return ROTATION_INVERTED;
+    }
+    return ROTATION_NORMAL;
+}
+
+static bool get_pointer_location(DaemonState *state, int *x, int *y) {
+    Window root_return;
+    Window child_return;
+    int root_x;
+    int root_y;
+    int win_x;
+    int win_y;
+    unsigned int mask_return;
+
+    if (!XQueryPointer(
+            state->display,
+            state->root,
+            &root_return,
+            &child_return,
+            &root_x,
+            &root_y,
+            &win_x,
+            &win_y,
+            &mask_return)) {
+        return false;
+    }
+
+    *x = root_x;
+    *y = root_y;
+    return true;
+}
+
+static bool map_touch_to_screen(DaemonState *state, int *x, int *y) {
+    double nx;
+    double ny;
+    double sx;
+    double sy;
+
+    if (!state->have_abs_x || !state->have_abs_y ||
+        state->abs_x_max <= state->abs_x_min ||
+        state->abs_y_max <= state->abs_y_min) {
+        return false;
+    }
+
+    nx = (double)(state->current_x - state->abs_x_min) / (double)(state->abs_x_max - state->abs_x_min);
+    ny = (double)(state->current_y - state->abs_y_min) / (double)(state->abs_y_max - state->abs_y_min);
+
+    if (nx < 0.0) {
+        nx = 0.0;
+    } else if (nx > 1.0) {
+        nx = 1.0;
+    }
+    if (ny < 0.0) {
+        ny = 0.0;
+    } else if (ny > 1.0) {
+        ny = 1.0;
+    }
+
+    switch (state->rotation) {
+    case ROTATION_RIGHT:
+        sx = 1.0 - ny;
+        sy = nx;
+        break;
+    case ROTATION_LEFT:
+        sx = ny;
+        sy = 1.0 - nx;
+        break;
+    case ROTATION_INVERTED:
+        sx = 1.0 - nx;
+        sy = 1.0 - ny;
+        break;
+    case ROTATION_NORMAL:
+    default:
+        sx = nx;
+        sy = ny;
+        break;
+    }
+
+    *x = (int)(sx * (double)(state->screen_width - 1) + 0.5);
+    *y = (int)(sy * (double)(state->screen_height - 1) + 0.5);
+    return true;
+}
+
+static void grab_touch_device(DaemonState *state) {
+    unsigned char mask_bits[XIMaskLen(XI_LASTEVENT)] = {0};
+    XIEventMask mask;
+
+    if (state->touch_grabbed || !state->have_xi2 || state->touch_xi_id < 0) {
         return;
     }
-    if (!get_pointer_location(&state->pointer_x, &state->pointer_y)) {
-        state->pointer_x = 0;
-        state->pointer_y = 0;
+
+    mask.deviceid = state->touch_xi_id;
+    mask.mask_len = (int)sizeof(mask_bits);
+    mask.mask = mask_bits;
+
+    if (XIGrabDevice(
+            state->display,
+            state->touch_xi_id,
+            state->root,
+            CurrentTime,
+            None,
+            XIGrabModeAsync,
+            XIGrabModeAsync,
+            False,
+            &mask) == Success) {
+        state->touch_grabbed = true;
+        XSync(state->display, False);
     }
-    if (state->xinput_id[0] == '\0') {
-        refresh_xinput_id(state);
-    }
-    if (state->xinput_id[0] != '\0') {
-        snprintf(command, sizeof(command), "xinput disable %s >/dev/null 2>&1", state->xinput_id);
-        run_command_quiet(command);
-    }
-    state->input_frozen = true;
-    log_message("freeze pointer=(%d,%d)", state->pointer_x, state->pointer_y);
 }
 
-static void unfreeze_pointer(DaemonState *state) {
-    char command[128];
-
-    if (!state->input_frozen) {
+static void ungrab_touch_device(DaemonState *state) {
+    if (!state->touch_grabbed) {
         return;
     }
-    if (state->xinput_id[0] != '\0') {
-        snprintf(command, sizeof(command), "xinput enable %s >/dev/null 2>&1", state->xinput_id);
-        run_command_quiet(command);
+
+    (void)XIUngrabDevice(state->display, state->touch_xi_id, CurrentTime);
+    XSync(state->display, False);
+    state->touch_grabbed = false;
+}
+
+static void emit_right_click_at(DaemonState *state, int x, int y) {
+    XWarpPointer(state->display, None, state->root, 0, 0, 0, 0, x, y);
+    XSync(state->display, False);
+    XTestFakeButtonEvent(state->display, Button3, True, CurrentTime);
+    XTestFakeButtonEvent(state->display, Button3, False, CurrentTime);
+    XSync(state->display, False);
+}
+
+static void hide_overlay(DaemonState *state);
+
+static void release_left_button(DaemonState *state) {
+    XTestFakeButtonEvent(state->display, Button1, False, CurrentTime);
+    XSync(state->display, False);
+}
+
+static void cancel_pre_arm_press(DaemonState *state) {
+    state->cancelled = true;
+    hide_overlay(state);
+}
+
+static void cancel_armed_press(DaemonState *state) {
+    state->cancelled = true;
+    state->armed = false;
+    state->completed = false;
+    hide_overlay(state);
+    release_left_button(state);
+}
+
+static void hide_overlay(DaemonState *state) {
+    if (!state->overlay_visible) {
+        return;
     }
-    state->input_frozen = false;
-    log_message("unfreeze");
+
+    XUnmapWindow(state->display, state->overlay);
+    XFlush(state->display);
+    state->overlay_visible = false;
 }
 
-static void emit_right_click(void) {
-    run_command_quiet("xdotool mousedown --clearmodifiers 3 >/dev/null 2>&1");
-    sleep_milliseconds(30);
-    run_command_quiet("xdotool mouseup --clearmodifiers 3 >/dev/null 2>&1");
+static void show_overlay_size(DaemonState *state, int size) {
+    int line_width = state->config.line_width;
+    int left;
+    int top;
+    XRectangle rects[4];
+
+    if (size < line_width * 2) {
+        size = line_width * 2;
+    }
+
+    left = state->pointer_x - size / 2;
+    top = state->pointer_y - size / 2;
+
+    rects[0] = (XRectangle){0, 0, (unsigned short)size, (unsigned short)line_width};
+    rects[1] = (XRectangle){0, (short)(size - line_width), (unsigned short)size, (unsigned short)line_width};
+    rects[2] = (XRectangle){0, 0, (unsigned short)line_width, (unsigned short)size};
+    rects[3] = (XRectangle){(short)(size - line_width), 0, (unsigned short)line_width, (unsigned short)size};
+
+    XMoveResizeWindow(state->display, state->overlay, left, top, (unsigned int)size, (unsigned int)size);
+    XShapeCombineRectangles(state->display, state->overlay, ShapeBounding, 0, 0, rects, 4, ShapeSet, 0);
+    XClearWindow(state->display, state->overlay);
+
+    if (!state->overlay_visible) {
+        XMapRaised(state->display, state->overlay);
+        state->overlay_visible = true;
+    }
+
+    XFlush(state->display);
 }
 
-static int open_touch_device(char *path, size_t path_size) {
+static void reset_press(DaemonState *state) {
+    state->have_x = false;
+    state->have_y = false;
+    state->finger_down = false;
+    state->armed = false;
+    state->cancelled = false;
+    state->completed = false;
+    state->triggered = false;
+    state->arm_deadline_ms = 0;
+    state->animation_started_ms = 0;
+    hide_overlay(state);
+    ungrab_touch_device(state);
+}
+
+static void start_press(DaemonState *state, unsigned long long now_ms) {
+    state->finger_down = true;
+    state->armed = false;
+    state->cancelled = false;
+    state->completed = false;
+    state->triggered = false;
+    state->arm_deadline_ms = now_ms + (unsigned long long)state->config.pre_arm_ms;
+    state->animation_started_ms = 0;
+    state->anchor_x = state->current_x;
+    state->anchor_y = state->current_y;
+    hide_overlay(state);
+}
+
+static void finish_press(DaemonState *state) {
+    if (state->completed && !state->triggered) {
+        hide_overlay(state);
+        emit_right_click_at(state, state->pointer_x, state->pointer_y);
+        state->triggered = true;
+    }
+    reset_press(state);
+}
+
+static void handle_motion(DaemonState *state) {
+    long dx;
+    long dy;
+
+    if (!state->finger_down || state->cancelled || state->triggered || !state->have_x || !state->have_y) {
+        return;
+    }
+
+    dx = (long)state->current_x - (long)state->anchor_x;
+    dy = (long)state->current_y - (long)state->anchor_y;
+    if (dx * dx + dy * dy > MOTION_THRESHOLD_SQ) {
+        if (state->armed) {
+            cancel_armed_press(state);
+        } else {
+            cancel_pre_arm_press(state);
+        }
+    }
+}
+
+static void process_event(DaemonState *state, const struct input_event *event) {
+    if (event->type == EV_ABS) {
+        if (event->code == ABS_X || event->code == ABS_MT_POSITION_X) {
+            state->current_x = event->value;
+            state->have_x = true;
+            handle_motion(state);
+        } else if (event->code == ABS_Y || event->code == ABS_MT_POSITION_Y) {
+            state->current_y = event->value;
+            state->have_y = true;
+            handle_motion(state);
+        }
+        return;
+    }
+
+    if (event->type == EV_KEY && event->code == BTN_TOUCH) {
+        if (event->value == 1) {
+            start_press(state, monotonic_milliseconds());
+        } else if (event->value == 0) {
+            finish_press(state);
+        }
+    }
+}
+
+static void select_touch_device(DaemonState *state, int fd, const char *name) {
+    state->touch_fd = fd;
+    state->touch_xi_id = -1;
+    snprintf(state->touch_name, sizeof(state->touch_name), "%s", name);
+    load_abs_info(state);
+}
+
+static int open_touch_device(DaemonState *state) {
     DIR *dir;
     struct dirent *entry;
-    int fd = -1;
+    int fallback_fd = -1;
+    char fallback_name[256] = {0};
 
     dir = opendir("/dev/input");
     if (!dir) {
@@ -258,28 +474,46 @@ static int open_touch_device(char *path, size_t path_size) {
     }
 
     while ((entry = readdir(dir)) != NULL) {
-        char full_path[PATH_MAX];
+        char path[PATH_MAX];
         char name[256] = {0};
+        int fd;
 
         if (strncmp(entry->d_name, "event", 5) != 0) {
             continue;
         }
-        snprintf(full_path, sizeof(full_path), "/dev/input/%s", entry->d_name);
-        fd = open(full_path, O_RDONLY | O_NONBLOCK);
+
+        snprintf(path, sizeof(path), "/dev/input/%s", entry->d_name);
+        fd = open(path, O_RDONLY | O_NONBLOCK);
         if (fd < 0) {
             continue;
         }
-        if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) >= 0 && strcmp(name, DEVICE_NAME) == 0) {
-            snprintf(path, path_size, "%s", full_path);
+        if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) < 0 || !is_touchscreen_device(fd)) {
+            close(fd);
+            continue;
+        }
+
+        if (strcmp(name, PREFERRED_TOUCH_NAME) == 0) {
+            if (fallback_fd >= 0) {
+                close(fallback_fd);
+            }
             closedir(dir);
+            select_touch_device(state, fd, name);
             return fd;
         }
-        close(fd);
-        fd = -1;
+
+        if (fallback_fd < 0) {
+            fallback_fd = fd;
+            snprintf(fallback_name, sizeof(fallback_name), "%s", name);
+        } else {
+            close(fd);
+        }
     }
 
     closedir(dir);
-    return -1;
+    if (fallback_fd >= 0) {
+        select_touch_device(state, fallback_fd, fallback_name);
+    }
+    return fallback_fd;
 }
 
 static bool init_overlay(DaemonState *state) {
@@ -287,16 +521,22 @@ static bool init_overlay(DaemonState *state) {
     Colormap colormap;
     XSetWindowAttributes attrs;
     char hex_color[16];
+    int xi_major = 2;
+    int xi_minor = 0;
 
     state->display = XOpenDisplay(NULL);
     if (!state->display) {
-        log_message("XOpenDisplay failed");
         return false;
     }
+
     state->screen = DefaultScreen(state->display);
     state->root = RootWindow(state->display, state->screen);
-    colormap = DefaultColormap(state->display, state->screen);
+    state->screen_width = DisplayWidth(state->display, state->screen);
+    state->screen_height = DisplayHeight(state->display, state->screen);
+    state->rotation = detect_display_rotation(state);
+    state->have_xi2 = XIQueryVersion(state->display, &xi_major, &xi_minor) == Success;
 
+    colormap = DefaultColormap(state->display, state->screen);
     touchrmb_config_format_color(&state->config, hex_color, sizeof(hex_color));
     if (!XParseColor(state->display, colormap, hex_color, &color) ||
         !XAllocColor(state->display, colormap, &color)) {
@@ -322,224 +562,100 @@ static bool init_overlay(DaemonState *state) {
         CWOverrideRedirect | CWBackPixel | CWBorderPixel,
         &attrs
     );
-    XFlush(state->display);
-    return true;
-}
-
-static void hide_overlay(DaemonState *state) {
-    if (!state->overlay_visible) {
-        return;
-    }
-    XUnmapWindow(state->display, state->overlay);
-    XFlush(state->display);
-    state->overlay_visible = false;
-}
-
-static void show_overlay_progress(DaemonState *state, double progress) {
-    int size;
-    int line_width;
-    int left;
-    int top;
-    XRectangle rects[4];
-
-    if (!state->display) {
-        return;
-    }
-    if (progress < 0.0) {
-        progress = 0.0;
-    }
-    if (progress > 1.0) {
-        progress = 1.0;
-    }
-
-    line_width = state->config.line_width;
-    size = (int)(10.0 + progress * (double)(state->config.square_size - 10) + 0.5);
-    if (size < line_width * 2) {
-        size = line_width * 2;
-    }
-
-    left = state->pointer_x - size / 2;
-    top = state->pointer_y - size / 2;
-
-    rects[0] = (XRectangle){0, 0, (unsigned short)size, (unsigned short)line_width};
-    rects[1] = (XRectangle){0, (short)(size - line_width), (unsigned short)size, (unsigned short)line_width};
-    rects[2] = (XRectangle){0, 0, (unsigned short)line_width, (unsigned short)size};
-    rects[3] = (XRectangle){(short)(size - line_width), 0, (unsigned short)line_width, (unsigned short)size};
-
-    XMoveResizeWindow(state->display, state->overlay, left, top, (unsigned int)size, (unsigned int)size);
-    XShapeCombineRectangles(state->display, state->overlay, ShapeBounding, 0, 0, rects, 4, ShapeSet, 0);
 #ifdef ShapeInput
     XShapeCombineRectangles(state->display, state->overlay, ShapeInput, 0, 0, NULL, 0, ShapeSet, 0);
 #endif
-    XClearWindow(state->display, state->overlay);
-    if (!state->overlay_visible) {
-        XMapRaised(state->display, state->overlay);
-        state->overlay_visible = true;
-    } else {
-        XRaiseWindow(state->display, state->overlay);
-    }
     XFlush(state->display);
-}
-
-static void reset_press(DaemonState *state) {
-    state->finger_down = false;
-    state->armed = false;
-    state->cancelled = false;
-    state->completed = false;
-    state->triggered = false;
-    state->down_since = 0.0;
-    state->arm_deadline = 0.0;
-    state->animation_started_at = 0.0;
-    state->have_x = false;
-    state->have_y = false;
-    hide_overlay(state);
-    unfreeze_pointer(state);
-}
-
-static void on_press(DaemonState *state) {
-    double now = monotonic_seconds();
-
-    state->finger_down = true;
-    state->armed = false;
-    state->cancelled = false;
-    state->completed = false;
-    state->triggered = false;
-    state->down_since = now;
-    state->arm_deadline = now + (double)state->config.pre_arm_ms / 1000.0;
-    state->animation_started_at = 0.0;
-    state->anchor_x = state->current_x;
-    state->anchor_y = state->current_y;
-    hide_overlay(state);
-    log_message("press anchor=(%.1f,%.1f)", state->anchor_x, state->anchor_y);
-}
-
-static void on_release(DaemonState *state) {
-    double held_for = state->down_since > 0.0 ? monotonic_seconds() - state->down_since : 0.0;
-
-    if (state->completed && !state->triggered) {
-        hide_overlay(state);
-        XSync(state->display, False);
-        sleep_milliseconds(30);
-        emit_right_click();
-        state->triggered = true;
-        log_message(
-            "right click emitted held_for=%.3f pointer=(%d,%d)",
-            held_for,
-            state->pointer_x,
-            state->pointer_y
-        );
-    } else {
-        log_message("release before completion held_for=%.3f", held_for);
-    }
-    reset_press(state);
-}
-
-static void handle_motion(DaemonState *state) {
-    if (!state->finger_down || state->armed || state->triggered || state->cancelled || !state->have_x || !state->have_y) {
-        return;
-    }
-    if (!distance_exceeded(
-            state->anchor_x,
-            state->anchor_y,
-            state->current_x,
-            state->current_y,
-            18.0)) {
-        return;
-    }
-
-    state->cancelled = true;
-    hide_overlay(state);
-    log_message(
-        "long press cancelled by motion start=(%.1f,%.1f) current=(%.1f,%.1f)",
-        state->anchor_x,
-        state->anchor_y,
-        state->current_x,
-        state->current_y
-    );
-}
-
-static void process_event(DaemonState *state, const struct input_event *event) {
-    if (event->type == EV_ABS) {
-        if (event->code == ABS_X || event->code == ABS_MT_POSITION_X) {
-            state->current_x = (double)event->value;
-            state->have_x = true;
-            handle_motion(state);
-        } else if (event->code == ABS_Y || event->code == ABS_MT_POSITION_Y) {
-            state->current_y = (double)event->value;
-            state->have_y = true;
-            handle_motion(state);
-        }
-    } else if (event->type == EV_KEY && event->code == BTN_TOUCH) {
-        if (event->value == 1) {
-            on_press(state);
-        } else if (event->value == 0) {
-            on_release(state);
-        }
-    }
+    return true;
 }
 
 static void attach_touch_device(DaemonState *state) {
     if (state->touch_fd >= 0) {
         return;
     }
-    state->touch_fd = open_touch_device(state->touch_path, sizeof(state->touch_path));
-    if (state->touch_fd >= 0) {
-        refresh_xinput_id(state);
-        log_message("attached %s xinput=%s", state->touch_path, state->xinput_id[0] ? state->xinput_id : "none");
+
+    if (open_touch_device(state) >= 0) {
+        state->touch_xi_id = find_touch_xi_device(state);
     }
 }
 
-static void detach_touch_device(DaemonState *state, const char *reason) {
-    if (reason) {
-        log_message("%s", reason);
-    }
+static void detach_touch_device(DaemonState *state) {
     if (state->touch_fd >= 0) {
         close(state->touch_fd);
         state->touch_fd = -1;
     }
+    state->touch_xi_id = -1;
+    state->touch_name[0] = '\0';
+    state->have_abs_x = false;
+    state->have_abs_y = false;
     reset_press(state);
 }
 
-static void update_timers(DaemonState *state, double now) {
-    double progress;
+static void arm_press(DaemonState *state, unsigned long long now_ms) {
+    if (!get_pointer_location(state, &state->pointer_x, &state->pointer_y) &&
+        !map_touch_to_screen(state, &state->pointer_x, &state->pointer_y)) {
+        state->pointer_x = 0;
+        state->pointer_y = 0;
+    }
 
-    if (state->finger_down && !state->armed && !state->cancelled && !state->triggered && state->arm_deadline > 0.0 && now >= state->arm_deadline) {
-        state->armed = true;
-        state->animation_started_at = now;
-        freeze_pointer(state);
-        show_overlay_progress(state, 0.0);
-        log_message("armed");
+    state->armed = true;
+    state->animation_started_ms = now_ms;
+    grab_touch_device(state);
+    /* The initial touch press may already be interpreted as a primary-button hold.
+       Release it once the long-press gesture takes ownership to avoid desktop drag selection. */
+    release_left_button(state);
+    show_overlay_size(state, INITIAL_OVERLAY_SIZE);
+}
+
+static void update_timers(DaemonState *state, unsigned long long now_ms) {
+    unsigned long long elapsed;
+    unsigned long long duration;
+    int extra_size;
+    int size;
+
+    if (state->finger_down && !state->armed && !state->cancelled && !state->triggered &&
+        state->arm_deadline_ms > 0 && now_ms >= state->arm_deadline_ms) {
+        arm_press(state, now_ms);
     }
 
     if (!state->finger_down || !state->armed || state->triggered) {
         return;
     }
 
-    progress = (now - state->animation_started_at) / ((double)state->config.animation_ms / 1000.0);
-    if (progress > 1.0) {
-        progress = 1.0;
+    duration = (unsigned long long)(state->config.animation_ms > 0 ? state->config.animation_ms : 1);
+    elapsed = now_ms > state->animation_started_ms ? now_ms - state->animation_started_ms : 0;
+    if (elapsed > duration) {
+        elapsed = duration;
     }
-    show_overlay_progress(state, progress);
-    if (!state->completed && progress >= 1.0) {
+
+    extra_size = state->config.square_size - INITIAL_OVERLAY_SIZE;
+    size = INITIAL_OVERLAY_SIZE;
+    if (extra_size > 0) {
+        size += (int)((elapsed * (unsigned long long)extra_size + duration / 2ULL) / duration);
+    }
+    show_overlay_size(state, size);
+
+    if (!state->completed && elapsed >= duration) {
         state->completed = true;
-        log_message("completed");
     }
 }
 
-static int compute_poll_timeout_ms(const DaemonState *state, double now) {
+static int compute_poll_timeout_ms(const DaemonState *state, unsigned long long now_ms) {
     if (state->touch_fd < 0) {
         return 1000;
     }
+
     if (state->finger_down && !state->armed && !state->cancelled && !state->triggered) {
-        double remaining = state->arm_deadline - now;
-        if (remaining <= 0.0) {
+        if (now_ms >= state->arm_deadline_ms) {
             return 0;
         }
-        return (int)(remaining * 1000.0);
+        return (int)(state->arm_deadline_ms - now_ms);
     }
+
     if (state->finger_down && state->armed && !state->completed && !state->triggered) {
         return ANIMATION_FRAME_MS;
     }
+
     return -1;
 }
 
@@ -551,30 +667,25 @@ static bool acquire_lock(DaemonState *state) {
     if (!build_cache_path(path, sizeof(path), "touchrmb.lock")) {
         return false;
     }
+
     state->lock_fd = open(path, O_CREAT | O_RDWR, 0600);
-    if (state->lock_fd < 0) {
+    if (state->lock_fd < 0 || flock(state->lock_fd, LOCK_EX | LOCK_NB) != 0) {
         return false;
     }
-    if (flock(state->lock_fd, LOCK_EX | LOCK_NB) != 0) {
-        return false;
-    }
+
     snprintf(buffer, sizeof(buffer), "%ld\n", (long)getpid());
     if (ftruncate(state->lock_fd, 0) != 0) {
         return false;
     }
+
     ignored = write(state->lock_fd, buffer, strlen(buffer));
-    if (ignored < 0) {
-        return false;
-    }
-    return true;
+    return ignored >= 0;
 }
 
 static void cleanup(DaemonState *state) {
-    hide_overlay(state);
-    unfreeze_pointer(state);
+    reset_press(state);
     if (state->touch_fd >= 0) {
         close(state->touch_fd);
-        state->touch_fd = -1;
     }
     if (state->overlay) {
         XDestroyWindow(state->display, state->overlay);
@@ -593,6 +704,7 @@ int main(void) {
     memset(&state, 0, sizeof(state));
     state.touch_fd = -1;
     state.lock_fd = -1;
+    state.touch_xi_id = -1;
     g_home = getenv("HOME");
     if (!g_home || g_home[0] == '\0') {
         fprintf(stderr, "HOME is not set\n");
@@ -608,8 +720,6 @@ int main(void) {
         fprintf(stderr, "another instance is already running\n");
         return 1;
     }
-    log_message("instance lock acquired pid=%ld", (long)getpid());
-
     if (!init_overlay(&state)) {
         cleanup(&state);
         return 1;
@@ -619,11 +729,11 @@ int main(void) {
         struct pollfd pfd;
         int poll_count = 0;
         int timeout_ms;
-        double now = monotonic_seconds();
+        unsigned long long now_ms = monotonic_milliseconds();
 
         attach_touch_device(&state);
-        update_timers(&state, now);
-        timeout_ms = compute_poll_timeout_ms(&state, now);
+        update_timers(&state, now_ms);
+        timeout_ms = compute_poll_timeout_ms(&state, now_ms);
 
         memset(&pfd, 0, sizeof(pfd));
         if (state.touch_fd >= 0) {
@@ -636,12 +746,11 @@ int main(void) {
             if (errno == EINTR) {
                 continue;
             }
-            log_message("poll failed: %s", strerror(errno));
             break;
         }
 
         if (state.touch_fd >= 0 && (pfd.revents & (POLLERR | POLLHUP))) {
-            detach_touch_device(&state, "touch device disconnected");
+            detach_touch_device(&state);
             continue;
         }
 
@@ -657,8 +766,9 @@ int main(void) {
                     process_event(&state, &events[index]);
                 }
             }
+
             if (bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                detach_touch_device(&state, strerror(errno));
+                detach_touch_device(&state);
             }
         }
     }

@@ -1,58 +1,36 @@
 # TouchRMB
 
-TouchRMB is a lightweight touchscreen long-press to right-click implementation for the Chuwi Vi10 LXQt session.
+`TouchRMB` adds Windows-like right click by long press on a touchscreen in `LXQt/X11`.
 
-The project contains two binaries:
+It installs:
 
-- `touchrmb`: low-overhead daemon in plain C
-- `touchrmb-settings`: settings UI in C/GTK
+- `touchrmb` - low-overhead resident daemon in C
+- `touchrmb-settings` - GUI for delay, animation, size, border width, and color
 
-Design goals:
+## Requirements
 
-- no Python runtime for the resident daemon
-- direct `/dev/input/event*` reading via `linux/input.h`
-- `poll()` event loop with idle CPU near zero
-- `X11 + XShape` overlay for the expanding square
-- user-configurable hold delay, animation duration, square size, border width, and color
-
-## Build
-
-```sh
-make
-```
-
-Artifacts:
-
-```sh
-build/touchrmb
-build/touchrmb-settings
-```
+- Linux
+- X11 session
+- LXQt session
+- `systemd --user`
+- build tools and headers for: `x11`, `xext`, `xtst`, `xi`, `xrandr`, `gtk+-3.0`
 
 ## Install
 
-```sh
-install -Dm755 build/touchrmb ~/.local/bin/touchrmb
-install -Dm755 build/touchrmb-settings ~/.local/bin/touchrmb-settings
-install -Dm755 packaging/bin/run-touchrmb-in-lxqt-session.sh ~/.local/bin/run-touchrmb-in-lxqt-session.sh
-install -Dm644 packaging/systemd-user/touchrmb.service ~/.config/systemd/user/touchrmb.service
-install -Dm644 packaging/applications/touchrmb.desktop ~/.local/share/applications/touchrmb.desktop
-systemctl --user daemon-reload
-systemctl --user enable --now touchrmb.service
-```
-
-## Configuration
-
-User configuration is stored at:
+Clone the repository, enter it, then run:
 
 ```sh
-~/.config/touchrmb/config.ini
+./install.sh
 ```
 
-The settings application writes the config and restarts the user service.
+If prerequisites are missing, the script will stop and print the packages to install.
 
-## Runtime notes
+## Use
 
-- Touch device name is hardcoded as `CHPN0001:00`
-- Border-only overlay keeps the daemon light
-- Daemon log: `~/.cache/touchrmb.log`
-- Daemon lock: `~/.cache/touchrmb.lock`
+- Settings app: `touchrmb-settings`
+- Config file: `~/.config/touchrmb/config.ini`
+
+## Notes
+
+- The daemon works with direct-touch `evdev` devices and prefers `CHPN0001:00` when present.
+- It is designed for `LXQt/X11`, not for Wayland.

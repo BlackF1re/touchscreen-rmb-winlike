@@ -1,55 +1,30 @@
 #!/bin/sh
 set -eu
 
-find_lxqt_session_pid() {
-    pgrep -n lxqt-session 2>/dev/null || true
+find_session_pid() {
+    pgrep -n -x lxqt-session 2>/dev/null || true
 }
 
 load_session_env() {
     pid="$1"
-    python3 - "$pid" <<'PY'
-import pathlib
-import sys
-
-pid = sys.argv[1]
-raw = pathlib.Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
-keep = {
-    "DBUS_SESSION_BUS_ADDRESS",
-    "DISPLAY",
-    "GTK_CSD",
-    "GTK_OVERLAY_SCROLLING",
-    "QT_PLATFORM_PLUGIN",
-    "QT_QPA_PLATFORMTHEME",
-    "XAUTHORITY",
-    "XDG_CACHE_HOME",
-    "XDG_CONFIG_DIRS",
-    "XDG_CONFIG_HOME",
-    "XDG_CURRENT_DESKTOP",
-    "XDG_DATA_DIRS",
-    "XDG_DATA_HOME",
-    "XDG_MENU_PREFIX",
-    "XDG_RUNTIME_DIR",
-    "XDG_SESSION_DESKTOP",
-    "XDG_SESSION_TYPE",
-}
-for item in raw:
-    if not item or b"=" not in item:
-        continue
-    key, value = item.split(b"=", 1)
-    key = key.decode("utf-8", "ignore")
-    if key not in keep:
-        continue
-    value = value.decode("utf-8", "ignore").replace("\\", "\\\\").replace("\"", "\\\"")
-    print(f'export {key}="{value}"')
-PY
+    tr '\0' '\n' <"/proc/$pid/environ" | while IFS='=' read -r key value; do
+        case "$key" in
+            DBUS_SESSION_BUS_ADDRESS|DISPLAY|GTK_CSD|GTK_OVERLAY_SCROLLING|QT_PLATFORM_PLUGIN|QT_QPA_PLATFORMTHEME|XAUTHORITY|XDG_CACHE_HOME|XDG_CONFIG_DIRS|XDG_CONFIG_HOME|XDG_CURRENT_DESKTOP|XDG_DATA_DIRS|XDG_DATA_HOME|XDG_MENU_PREFIX|XDG_RUNTIME_DIR|XDG_SESSION_DESKTOP)
+                escaped="$(printf '%s' "$value" | sed 's/[\\"]/\\&/g')"
+                printf 'export %s="%s"\n' "$key" "$escaped"
+                ;;
+        esac
+    done
 }
 
 while :; do
-    pid="$(find_lxqt_session_pid)"
+    pid="$(find_session_pid || true)"
     if [ -n "$pid" ] && [ -r "/proc/$pid/environ" ]; then
         eval "$(load_session_env "$pid")"
-        systemctl --user stop touchscreen-rmb-winlike-c.service >/dev/null 2>&1 || true
-        pkill -x touchscreen-rmb-winlike-c >/dev/null 2>&1 || true
+        if [ "${DISPLAY:-}" = "" ]; then
+            sleep 2
+            continue
+        fi
         exec "$@"
     fi
     sleep 2

@@ -1,11 +1,12 @@
 CC ?= gcc
-CFLAGS ?= -O2 -pipe -Wall -Wextra -Wpedantic -std=c11
-LDFLAGS ?=
+CFLAGS ?= -O2 -pipe -flto -ffunction-sections -fdata-sections -Wall -Wextra -Wpedantic -std=c11
+LDFLAGS ?= -flto -Wl,--gc-sections -Wl,-O1
 PKG_CONFIG ?= pkg-config
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 APPDIR ?= $(PREFIX)/share/applications
 SYSTEMD_USER_DIR ?= $(PREFIX)/lib/systemd/user
+STRIP ?= strip
 
 COMMON_SRC = src/config.c
 DAEMON_SRC = src/touchrmb_daemon.c $(COMMON_SRC)
@@ -14,10 +15,10 @@ SETTINGS_SRC = src/touchrmb_settings.c $(COMMON_SRC)
 DAEMON_TARGET = build/touchrmb
 SETTINGS_TARGET = build/touchrmb-settings
 
-DAEMON_PKGS = x11 xext
+DAEMON_PKGS = x11 xext xtst xi xrandr
 SETTINGS_PKGS = gtk+-3.0
 
-.PHONY: all clean install
+.PHONY: all clean install install-only
 
 all: $(DAEMON_TARGET) $(SETTINGS_TARGET)
 
@@ -32,9 +33,12 @@ $(SETTINGS_TARGET): $(SETTINGS_SRC) src/config.h
 clean:
 	rm -rf build
 
-install: all
+install: all install-only
+
+install-only:
 	install -Dm755 $(DAEMON_TARGET) $(DESTDIR)$(BINDIR)/touchrmb
 	install -Dm755 $(SETTINGS_TARGET) $(DESTDIR)$(BINDIR)/touchrmb-settings
+	$(STRIP) $(DESTDIR)$(BINDIR)/touchrmb $(DESTDIR)$(BINDIR)/touchrmb-settings
 	install -Dm755 packaging/bin/run-touchrmb-in-lxqt-session.sh $(DESTDIR)$(BINDIR)/run-touchrmb-in-lxqt-session.sh
 	install -Dm644 packaging/systemd-user/touchrmb.service $(DESTDIR)$(SYSTEMD_USER_DIR)/touchrmb.service
 	install -Dm644 packaging/applications/touchrmb.desktop $(DESTDIR)$(APPDIR)/touchrmb.desktop

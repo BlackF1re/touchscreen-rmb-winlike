@@ -1,7 +1,6 @@
 #include "config.h"
 
 #include <stdbool.h>
-#include <stdio.h>
 #include <string.h>
 
 #include <gtk/gtk.h>
@@ -90,58 +89,39 @@ static void read_from_widgets(SettingsUi *ui, TouchRMBConfig *config) {
 }
 
 static gboolean restart_service(SettingsUi *ui) {
-    gchar *stdout_text = NULL;
-    gchar *stderr_text = NULL;
     gint exit_status = 0;
     GError *error = NULL;
-    gboolean ok;
-
     const gchar *argv[] = {
-        "/bin/sh",
-        "-lc",
-        "systemctl --user stop touchscreen-rmb-winlike-c.service >/dev/null 2>&1 || true; "
-        "pkill -x touchscreen-rmb-winlike-c >/dev/null 2>&1 || true; "
-        "systemctl --user stop touchrmb.service >/dev/null 2>&1 || true; "
-        "pkill -x touchrmb >/dev/null 2>&1 || true; "
-        "systemctl --user start touchrmb.service",
+        "systemctl",
+        "--user",
+        "restart",
+        "touchrmb.service",
         NULL
     };
 
-    ok = g_spawn_sync(
+    if (!g_spawn_sync(
         NULL,
         (gchar **)argv,
         NULL,
         G_SPAWN_SEARCH_PATH,
         NULL,
         NULL,
-        &stdout_text,
-        &stderr_text,
+        NULL,
+        NULL,
         &exit_status,
-        &error
-    );
-
-    if (!ok) {
+        &error)) {
         set_status(ui, error->message);
         g_clear_error(&error);
-        g_free(stdout_text);
-        g_free(stderr_text);
         return FALSE;
     }
 
-    if (exit_status != 0) {
-        if (stderr_text && stderr_text[0] != '\0') {
-            set_status(ui, stderr_text);
-        } else {
-            set_status(ui, "Failed to restart touchrmb.service");
-        }
-        g_free(stdout_text);
-        g_free(stderr_text);
+    if (!g_spawn_check_wait_status(exit_status, &error)) {
+        set_status(ui, error ? error->message : "Failed to restart touchrmb.service");
+        g_clear_error(&error);
         return FALSE;
     }
 
     set_status(ui, "Applied. TouchRMB restarted.");
-    g_free(stdout_text);
-    g_free(stderr_text);
     return TRUE;
 }
 
@@ -178,7 +158,7 @@ static void on_cancel_clicked(GtkButton *button, gpointer user_data) {
     set_status(ui, "Unsaved changes discarded");
 }
 
-static GtkWidget *labeled_spin(const char *label_text, GtkWidget *grid, int row, SettingsUi *ui, GtkSpinButton **out_spin, double min, double max, double step) {
+static void labeled_spin(const char *label_text, GtkWidget *grid, int row, SettingsUi *ui, GtkSpinButton **out_spin, double min, double max, double step) {
     GtkWidget *label = gtk_label_new(label_text);
     GtkWidget *spin = gtk_spin_button_new_with_range(min, max, step);
 
@@ -188,7 +168,6 @@ static GtkWidget *labeled_spin(const char *label_text, GtkWidget *grid, int row,
     gtk_grid_attach(GTK_GRID(grid), spin, 1, row, 1, 1);
     g_signal_connect(spin, "value-changed", G_CALLBACK(on_control_changed), ui);
     *out_spin = GTK_SPIN_BUTTON(spin);
-    return spin;
 }
 
 int main(int argc, char **argv) {
