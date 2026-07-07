@@ -2,6 +2,8 @@
 
 `TouchRMB` adds Windows-like right click by long press on a touchscreen in `LXQt/X11`.
 
+It is an independent implementation inspired by the long-press right-click UX found on Windows tablets. No Microsoft code or assets are included.
+
 It installs:
 
 - `touchrmb` - low-overhead resident daemon in C
@@ -34,3 +36,7 @@ If prerequisites are missing, the script will stop and print the packages to ins
 
 - The daemon works with direct-touch `evdev` devices and prefers `CHPN0001:00` when present.
 - It is designed for `LXQt/X11`, not for Wayland.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
