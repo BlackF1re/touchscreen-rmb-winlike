@@ -4,6 +4,16 @@
 
 It is an independent implementation inspired by the long-press right-click UX found on Windows tablets. No Microsoft code or assets are included.
 
+## Preview
+
+Long-press animation:
+
+![TouchRMB demo](touchrmb-demo.gif)
+
+Settings window:
+
+![TouchRMB settings](touchrmb-settings.png)
+
 It installs:
 
 - `touchrmb` - low-overhead resident daemon in C
@@ -19,13 +29,16 @@ It installs:
 
 ## Install
 
-Clone the repository, enter it, then run:
+Copy and paste this:
 
 ```sh
+git clone https://github.com/BlackF1re/touchscreen-rmb-winlike.git
+cd touchscreen-rmb-winlike
+chmod +x install.sh
 ./install.sh
 ```
 
-If prerequisites are missing, the script will stop and print the packages to install.
+If the system is compatible but missing prerequisites, the installer will stop and print the exact packages to install.
 
 ## Use
 
