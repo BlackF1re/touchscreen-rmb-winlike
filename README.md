@@ -52,4 +52,4 @@ If the system is compatible but missing prerequisites, the installer will stop a
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+BSD 3-Clause. See [LICENSE](LICENSE).
