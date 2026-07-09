@@ -32,8 +32,8 @@ It installs:
 Copy and paste this:
 
 ```sh
-git clone https://github.com/BlackF1re/touchscreen-rmb-winlike.git
-cd touchscreen-rmb-winlike
+git clone https://github.com/BlackF1re/TouchRMB.git
+cd TouchRMB
 chmod +x install.sh
 ./install.sh
 ```
