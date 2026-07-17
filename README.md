@@ -1,6 +1,6 @@
 # TouchRMB
 
-`TouchRMB` adds Windows-like right click by long tap on a touchscreen in `LXQt/X11`.
+`TouchRMB` adds Windows-like right click by long tap on a touchscreen in `X11` desktop sessions.
 
 It is an independent implementation inspired by the long-tap right-click UX found on Windows tablets. No Microsoft code or assets are included.
 
@@ -23,7 +23,7 @@ It installs:
 
 - Linux
 - X11 session
-- LXQt session
+- X11 desktop session such as `LXQt` or `XFCE`
 - `systemd --user`
 - build tools and headers for: `x11`, `xext`, `xtst`, `xi`, `xrandr`, `gtk+-3.0`
 
@@ -48,7 +48,7 @@ If the system is compatible but missing prerequisites, the installer will stop a
 ## Notes
 
 - The daemon works with direct-touch `evdev` devices and prefers `CHPN0001:00` when present.
-- It is designed for `LXQt/X11`, not for Wayland yet.
+- It is designed for `X11` desktop sessions, not for Wayland yet.
 
 ## License
 

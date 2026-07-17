@@ -2,7 +2,24 @@
 set -eu
 
 find_session_pid() {
-    pgrep -n -x lxqt-session 2>/dev/null || true
+    for name in \
+        lxqt-session \
+        xfce4-session \
+        mate-session \
+        cinnamon-session \
+        gnome-session-binary \
+        gnome-session \
+        startplasma-x11 \
+        plasmashell \
+        openbox
+    do
+        pid="$(pgrep -n -x "$name" 2>/dev/null || true)"
+        if [ -n "$pid" ]; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    done
+    return 1
 }
 
 load_session_env() {

@@ -28,15 +28,15 @@ have_pkg_config_module() {
 
 append_pkg_hint() {
     if command -v apt-get >/dev/null 2>&1; then
-        append_line PKG_HINT "sudo apt-get install build-essential pkg-config libx11-dev libxext-dev libxtst-dev libxi-dev libxrandr-dev libgtk-3-dev lxqt-session"
+        append_line PKG_HINT "sudo apt-get install build-essential pkg-config libx11-dev libxext-dev libxtst-dev libxi-dev libxrandr-dev libgtk-3-dev"
         return
     fi
     if command -v dnf >/dev/null 2>&1; then
-        append_line PKG_HINT "sudo dnf install gcc make pkgconf-pkg-config libX11-devel libXext-devel libXtst-devel libXi-devel libXrandr-devel gtk3-devel lxqt-session"
+        append_line PKG_HINT "sudo dnf install gcc make pkgconf-pkg-config libX11-devel libXext-devel libXtst-devel libXi-devel libXrandr-devel gtk3-devel"
         return
     fi
     if command -v pacman >/dev/null 2>&1; then
-        append_line PKG_HINT "sudo pacman -S base-devel pkgconf libx11 libxext libxtst libxi libxrandr gtk3 lxqt-session"
+        append_line PKG_HINT "sudo pacman -S base-devel pkgconf libx11 libxext libxtst libxi libxrandr gtk3"
         return
     fi
 }
@@ -67,12 +67,8 @@ if ! have_pkg_config_module x11 xext xtst xi xrandr gtk+-3.0; then
     append_pkg_hint
 fi
 
-if ! command -v lxqt-session >/dev/null 2>&1; then
-    append_line WARNINGS "LXQt session was not detected. TouchRMB targets LXQt/X11 and may not autostart correctly outside LXQt."
-fi
-
 if [ "${XDG_SESSION_TYPE:-}" != "" ] && [ "${XDG_SESSION_TYPE:-}" != "x11" ]; then
-    append_line WARNINGS "Current session type is ${XDG_SESSION_TYPE}. TouchRMB targets X11."
+    append_line WARNINGS "Current session type is ${XDG_SESSION_TYPE}. TouchRMB targets X11 desktop sessions."
 fi
 
 if [ ! -S "/run/user/$TARGET_UID/bus" ]; then
